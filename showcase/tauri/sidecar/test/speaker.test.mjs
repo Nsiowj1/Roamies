@@ -1,9 +1,22 @@
 import assert from 'node:assert/strict';
 import { createSpeaker, BEATS, bundledBeats } from '../speaker.mjs';
-import { FISH_MODELS } from '../fish.mjs';
-import { readFileSync } from 'node:fs';
+import { RATE, DEFAULT_VOICE, setTTS } from '../kokoro.mjs';
 
-// A FishVoice stand-in the test drives by hand.
+// A stand-in for the KokoroTTS model: stream() consumes a FakeSplitter, one piece per chunk,
+// then closes. Unlike ttsImpl = {} (broken — no stream()), this never calls the real model.
+const fakeTTS = (pieces = [[1]]) => ({
+  async *stream(splitter) {
+    for (let i = 0;;) {
+      while (i >= splitter.chunks.length && splitter.open) await new Promise((r) => setTimeout(r, 0));
+      if (i >= splitter.chunks.length) return;
+      splitter.chunks[i++]; // discard
+      yield { text: splitter.chunks[i - 1], audio: new Float32Array(pieces[Math.min(i - 1, pieces.length - 1)]) };
+    }
+  },
+});
+
+// A KokoroVoice stand-in the test drives by hand. Like the real KokoroVoice, end() does not
+// fire onEnd: the model keeps streaming until the test calls onAudio/onEnd/onError itself.
 const made = [];
 class FakeVoice {
   constructor(o) { Object.assign(this, o); this.said = []; this.ended = false; this.aborted = false; made.push(this); }
@@ -12,198 +25,133 @@ class FakeVoice {
   end() { this.ended = true; }
   abort() { this.aborted = true; }
 }
-const setup = (acct = { ok: true, credit: 4.5 }, beatPhrases = [], bundled = () => null) => {
-  made.length = 0;
-  const out = [], problems = [];
-  const sp = createSpeaker({ emit: (m) => out.push(m), onProblem: (p) => problems.push(p), FishVoiceImpl: FakeVoice, account: async () => acct, beatPhrases, bundled });
-  return { sp, out, problems };
-};
 const tick = () => new Promise((r) => setTimeout(r, 0));
+// fakeTTS: a proper KokoroTTS stand-in with a working stream() — unlike ttsImpl = {} (broken).
+const setup = (beatPhrases = [], bundled = () => null, fakeModel = fakeTTS()) => {
+  made.length = 0;
+  setTTS(fakeModel); // always inject so startModel() uses the fake, never the real model
+  const out = [], problems = [], logs = [];
+  const sp = createSpeaker({ emit: (m) => out.push(m), onProblem: (p) => problems.push(p), log: (k, v) => logs.push([k, v]), KokoroVoiceImpl: FakeVoice, beatPhrases, bundled, ttsImpl: null });
+  return { sp, out, problems, logs };
+};
+// Let the background beat-making (warm) run: drive each FakeVoice it makes to the end.
+const warmUp = async (sp, n) => {
+  for (let i = 0; i < 100 && sp.ready < n; i++) {
+    while (made.length) { const v = made.shift(); v.onAudio?.(new Int16Array([7])); v.onEnd(); }
+    await tick();
+  }
+};
 
-{ // No key: no voice.
+{ // No model, no voice: Kokoro isn't loaded yet.
   const { sp } = setup();
+  assert.equal(sp.on, false);
   assert.equal(sp.start(), null);
 }
-{ // Credit → Drama 3; audio goes out as base64 with the reply's id; end marks the end.
+{ // startModel loads Kokoro (a stand-in here), then replies speak.
   const { sp, out } = setup();
-  sp.setKey('k'); await tick();
-  assert.equal(sp.model, 'drama-3');
-  const r = sp.start();
-  assert.deepEqual(out.at(-1), { kind: 'speech', stop: true }, 'a new reply stops whatever was playing');
-  r.say('Hi.'); r.end();
-  const v = made[0];
-  assert.equal(v.model, 'drama-3'); assert.deepEqual(v.said, ['Hi.']); assert.ok(v.ended);
-  v.onAudio(new Uint8Array([1, 0, 2, 0]));
-  assert.deepEqual(out.at(-1), { kind: 'speech', id: r.id, rate: 44100, pcm: Buffer.from([1, 0, 2, 0]).toString('base64') });
-  v.onEnd();
-  assert.deepEqual(out.at(-1), { kind: 'speech', id: r.id, end: true, chars: 3 }, 'a whole reply says how much it said');
+  await sp.startModel();
+  assert.equal(sp.on, true);
+  const v = sp.start();
+  assert.ok(v);
+  assert.equal(sp.voice, DEFAULT_VOICE);
+  v.say('Hello.'); v.end();
+  assert.deepEqual(made[0].said, ['Hello.']);
+  made[0].onAudio(new Int16Array([1, 2])); made[0].onEnd();
+  assert.deepEqual(out, [
+    { kind: 'speech', stop: true },
+    { kind: 'speech', id: 's1', rate: RATE, pcm: Buffer.from(new Int16Array([1, 2]).buffer).toString('base64') },
+    { kind: 'speech', id: 's1', end: true, chars: 6 },
+  ]);
 }
-{ // No credit → the free model.
-  const { sp } = setup({ ok: true, credit: 0 });
-  sp.setKey('k'); await tick();
-  assert.equal(sp.model, 's2.1-pro-free');
+{ // A reply that never made a sound is a problem; one that did is not.
+  const { sp, problems } = setup();
+  await sp.startModel();
+  let v = sp.start();
+  v.end(); made[0].onError(Object.assign(new Error('Kokoro blew up'), { heard: false }));
+  assert.deepEqual(problems, ['Kokoro blew up']);
+  v = sp.start();
+  v.end(); made[1].onAudio(new Int16Array([1])); made[1].onError(Object.assign(new Error('late'), { heard: true }));
+  assert.deepEqual(problems, ['Kokoro blew up']);
+  // The end still goes out either way, so the bubble never hangs: with audio, chars are counted.
+  assert.equal(sp.start().id, 's3');
 }
-{ // Fails before any audio → retried once on the free model with everything said so far, and ended again.
-  const { sp, out, problems } = setup({ ok: true, credit: 0 });
-  sp.setKey('k');
-  const r = sp.start(); // started before the account check finished: still on production
-  r.say('One.'); r.say('Two.'); r.end();
-  await made[0].onError(Object.assign(new Error('Could not reach Fish Audio'), { heard: false }));
-  assert.equal(made.length, 2); assert.equal(made[1].model, 's2.1-pro-free');
-  assert.deepEqual(made[1].said, ['One.', 'Two.']); assert.ok(made[1].ended);
-  made[1].onAudio(new Uint8Array([0, 0])); made[1].onEnd();
-  assert.deepEqual(out.at(-1), { kind: 'speech', id: r.id, end: true, chars: 9 }); assert.deepEqual(problems, []);
-}
-{ // A bad key: no retry, one problem report, the reply ends (text stays).
-  const { sp, out, problems } = setup({ ok: false, reason: 'key' });
-  sp.setKey('bad');
-  const r = sp.start(); r.say('Hi.');
-  await made[0].onError(Object.assign(new Error('Could not reach Fish Audio'), { heard: false }));
-  assert.equal(made.length, 1); assert.deepEqual(problems, ['key']);
-  assert.deepEqual(out.at(-1), { kind: 'speech', id: r.id, end: true });
-}
-{ // Fails after audio started: no retry (it would repeat itself), no problem shown, just ends.
-  const { sp, problems, out } = setup();
-  sp.setKey('k');
-  const r = sp.start(); r.say('Hi.');
-  made[0].onAudio(new Uint8Array([0, 0]));
-  await made[0].onError(Object.assign(new Error('dropped'), { heard: true }));
-  assert.equal(made.length, 1); assert.deepEqual(problems, []);
-  assert.deepEqual(out.at(-1), { kind: 'speech', id: r.id, end: true });
-}
-{ // A new reply aborts the old one; the old one's late audio and end are ignored.
+{ // Cues are counted out of the character bill: they're for bubbles, not the ear.
   const { sp, out } = setup();
-  sp.setKey('k');
-  const a = sp.start(); a.say('Old.');
-  const b = sp.start();
-  assert.ok(made[0].aborted);
-  const n = out.length;
-  made[0].onAudio(new Uint8Array([0, 0])); made[0].onEnd();
-  assert.equal(out.length, n, 'nothing from the stopped reply');
-  b.say('New.'); assert.deepEqual(made[1].said, ['New.']);
+  await sp.startModel();
+  const v = sp.start();
+  v.say('[warm] Hello there.'); v.end();
+  made[0].onAudio(new Int16Array([1])); made[0].onEnd();
+  assert.equal(out.find((m) => m.end).chars, 12, "'[warm] Hello there.' is billed as 'Hello there.'");
 }
-{ // stop() (Stop, barge-in): aborts and tells the overlay to go quiet.
+{ // A new reply stops the running one; stop() stops the running one and quiets the overlay.
   const { sp, out } = setup();
-  sp.setKey('k');
-  sp.start().say('Hi.');
+  await sp.startModel();
+  const v = sp.start();
+  sp.start();
+  assert.equal(made[0].aborted, true, 'start() stops the previous reply');
   sp.stop();
-  assert.ok(made[0].aborted); assert.deepEqual(out.at(-1), { kind: 'speech', stop: true });
+  assert.equal(made[1].aborted, true);
+  assert.equal(out.filter((m) => m.stop && !m.id).length, 3, 'each of the two starts and the stop tell the overlay to go quiet');
 }
-{ // Beats are made once in the voice; a slow tool with nothing said plays one instantly, only once per reply.
-  const { sp, out } = setup(undefined, BEATS);
-  sp.setKey('k'); await tick();
-  for (let i = 0; i < BEATS.length; i++) { const w = made.at(-1); assert.deepEqual(w.said, [BEATS[i]]); w.onAudio(new Uint8Array([i, 0])); w.onEnd(); await tick(); await tick(); }
-  assert.equal(sp.ready, BEATS.length);
-  const r = sp.start(), n = made.length;
-  assert.equal(r.beat(), true);
-  const played = out.at(-1);
-  assert.deepEqual({ ...played, pcm: undefined }, { kind: 'speech', id: r.id, rate: 44100, pcm: undefined });
-  assert.ok(BEATS.some((_, i) => played.pcm === Buffer.from([i, 0]).toString('base64')), 'one of the made beats');
-  assert.equal(made.length, n, 'no extra socket for the beat');
-  assert.deepEqual(made.at(-1).said, [], 'the beat came from the cache, not the live socket');
-  assert.equal(r.beat(), false, 'once per reply');
-  const r2 = sp.start(); r2.say('Already talking.');
-  assert.equal(r2.beat(), false, 'not when it already said something');
+{ // A beat goes out instantly when it's shipped with the app, and never before the model said anything.
+  const shipped = new Map([['One sec.', { rate: RATE, pcm: 'abc' }]]);
+  const { sp, out } = setup(['One sec.'], () => shipped); // deterministic: only one phrase, and it's shipped
+  await sp.startModel();
+  const v = sp.start();
+  made.length = 0; // zero out the voice that start() makes; we're testing the beat path
+  assert.equal(v.beat(), true);
+  assert.ok(out.some((m) => m.id === 's1' && m.pcm === 'abc' && m.rate === RATE), 'the shipped beat goes out under the reply id');
+  assert.equal(made.length, 0, 'a shipped beat needs no voice of its own');
+  assert.equal(v.beat(), false, 'only one beat per reply');
+  v.say('Hi');
+  assert.equal(v.beat(), false, 'never a beat after the model said something');
 }
-{ // No beats made yet (or making them failed): the beat is spoken live instead.
-  const { sp } = setup(undefined, BEATS);
-  sp.setKey('k');
-  const r = sp.start(); const live = made.at(-1);
-  assert.equal(r.beat(), true);
-  assert.ok(BEATS.includes(live.said[0]));
+{ // Without a shipped beat, the beat is spoken live through the voice.
+  const { sp } = setup(['On it.']);
+  await sp.startModel();
+  const v = sp.start();
+  assert.equal(v.beat(), true);
+  assert.deepEqual(made[0].said, ['On it.']);
 }
-{ // Drama 3 fails before any audio with credit left → S2.1 Pro, and the one that worked is kept for the next reply.
-  const { sp, problems } = setup();
-  sp.setKey('k'); await tick();
-  const r = sp.start(); r.say('Hi.'); r.end();
-  const v = made.slice(made.length - 1); // this reply's sockets (an earlier test's beat warm-up can add to made)
-  await v[0].onError(Object.assign(new Error('Fish Audio closed the connection'), { heard: false }));
-  v.push(made.at(-1));
-  assert.equal(v[0].model, 'drama-3'); assert.equal(v[1].model, 's2.1-pro'); assert.deepEqual(v[1].said, ['Hi.']);
-  v[1].onAudio(new Uint8Array([0, 0])); v[1].onEnd();
-  assert.equal(sp.model, 's2.1-pro'); assert.deepEqual(problems, []);
-  sp.start(); assert.equal(made.at(-1).model, 's2.1-pro');
+{ // Beats are made once in the current voice (the first ones during startModel), then played instantly.
+  const phrases = ['One sec.', 'On it.', 'Checking.'];
+  const { sp, out } = setup(phrases, () => null);
+  await sp.startModel();
+  assert.equal(sp.ready, 0, 'no beats are cached until warm() makes them');
+  await warmUp(sp, phrases.length);
+  assert.equal(sp.ready, phrases.length);
+  const v = sp.start();
+  const before = made.length;
+  assert.equal(v.beat(), true);
+  assert.equal(made.length, before, 'the beat plays from the cache; it needs no voice of its own');
+  assert.ok(out.some((m) => m.pcm && m.id === v.id && !m.end), 'the cached beat audio went out under the reply id');
+  // And changing the voice remakes them.
+  made.length = 0;
+  sp.setVoice('am_fenrir');
+  assert.equal(sp.voice, 'am_fenrir');
+  await warmUp(sp, phrases.length);
+  assert.equal(made.every((v) => v.voice === 'am_fenrir'), true);
+  // An empty or unknown voice name falls back to the default.
+  sp.setVoice('');
+  assert.equal(sp.voice, DEFAULT_VOICE);
 }
-{ // Every model fails before audio → tried once on each, then one problem report.
-  const { sp, problems } = setup();
-  sp.setKey('k'); await tick();
-  sp.start().say('Hi.');
-  const v = [made.at(-1)];
-  for (let i = 0; i < 3; i++) { await v[i].onError(Object.assign(new Error('Could not reach Fish Audio'), { heard: false })); if (i < 2) v.push(made.at(-1)); }
-  assert.deepEqual(v.map((x) => x.model), ['drama-3', 's2.1-pro', 's2.1-pro-free']);
-  assert.equal(made.at(-1), v[2], 'no fourth try');
-  assert.deepEqual(problems, ['Could not reach Fish Audio']);
+{ // Bundled beats: the index next to this file has none yet (they're recorded on a machine with the model).
+  const bundled = bundledBeats();
+  assert.equal(bundled(DEFAULT_VOICE), null, 'no af_heart beats are recorded yet');
+  assert.equal(bundled('nobody'), null);
+  const missing = bundledBeats('/no/such/dir');
+  assert.equal(missing(DEFAULT_VOICE), null, 'a missing beats folder means none shipped');
 }
-{ // Picking S2.1 Pro: replies use it, and a failure falls back to the free tier, never up to the pricier Drama 3.
-  const { sp, problems } = setup();
-  sp.setModel('s2.1-pro');
-  sp.setKey('k'); await tick();
-  assert.equal(sp.pick, 's2.1-pro');
-  sp.start().say('Hi.');
-  const v = [made.at(-1)];
-  assert.equal(v[0].model, 's2.1-pro');
-  for (let i = 0; i < 2; i++) { await v[i].onError(Object.assign(new Error('Could not reach Fish Audio'), { heard: false })); if (i < 1) v.push(made.at(-1)); }
-  assert.deepEqual(v.map((x) => x.model), ['s2.1-pro', 's2.1-pro-free']);
-  assert.equal(made.at(-1), v[1], 'no third try, and never Drama 3');
-  assert.deepEqual(problems, ['Could not reach Fish Audio']);
+{ // Beat logging names the moment the beat played.
+  const shipped = new Map([['Okay.', { rate: RATE, pcm: 'z' }]]);
+  const { sp, logs } = setup(BEATS, () => shipped);
+  await sp.startModel();
+  const v = sp.start();
+  v.beat();
+  assert.deepEqual(logs.find(([k]) => k === 'speech_beat')[0], 'speech_beat');
 }
-{ // Switching the pick: the next reply uses it; no credit keeps it on the free tier; only real choices count.
-  const { sp } = setup({ ok: true, credit: 0 });
-  sp.setKey('k'); await tick();
-  sp.setModel('s2.1-pro');
-  assert.equal(sp.pick, 's2.1-pro');
-  assert.equal(sp.model, 's2.1-pro-free', 'no credit stays free');
-  sp.setModel('s2.1-pro-free'); sp.setModel('nope');
-  assert.equal(sp.pick, 's2.1-pro', 'the free tier and unknown names are not picks');
-  const { sp: sp2 } = setup();
-  sp2.setKey('k'); await tick();
-  sp2.setModel('s2.1-pro');
-  sp2.start(); assert.equal(made.at(-1).model, 's2.1-pro');
-  sp2.setModel('drama-3');
-  sp2.start(); assert.equal(made.at(-1).model, 'drama-3');
+{ // The default beat phrases are short, so a beat never sounds canned.
+  assert.ok(BEATS.length >= 30);
+  for (const p of BEATS) assert.ok(p.length <= 16, `"${p}" stays short`);
 }
 console.log('speaker tests: passed');
-{ // Voice cues aren't counted as spoken text.
-  const { sp, out } = setup();
-  sp.setKey('k');
-  const r = sp.start(); r.say('[warm] Hello there.'); r.end();
-  made.at(-1).onAudio(new Uint8Array([0, 0])); made.at(-1).onEnd();
-  assert.deepEqual(out.at(-1), { kind: 'speech', id: r.id, end: true, chars: 12 });
-  console.log('speech pacing tests: passed');
-}
-
-{ // At least 30 short beats, one or two words each, picked at random with no repeat among the last few.
-  assert.ok(BEATS.length >= 30, 'plenty of beats');
-  assert.equal(new Set(BEATS).size, BEATS.length, 'no duplicates');
-  for (const b of BEATS) assert.ok(b.replace(/[.,!]/g, '').trim().split(/\s+/).length <= 2, `${b} is one or two words`);
-  const { sp, out } = setup(undefined, BEATS);
-  sp.setKey('k'); await tick();
-  for (let i = 0; i < BEATS.length; i++) { const w = made.at(-1); w.onAudio(new Uint8Array([i, 1])); w.onEnd(); await tick(); await tick(); }
-  const seen = [];
-  for (let i = 0; i < 40; i++) { const r = sp.start(); r.beat(); seen.push(out.at(-1).pcm); r.abort(); }
-  for (let i = 0; i < seen.length; i++) assert.ok(!seen.slice(Math.max(0, i - 8), i).includes(seen[i]), 'no repeat within 8');
-  assert.ok(new Set(seen).size > 12, 'they vary');
-}
-console.log('speaker beat variety: passed');
-
-{ // Beats shipped with the app play at their own rate, and none are made over Fish for them.
-  const clip = { rate: 24000, pcm: Buffer.from([7, 7]).toString('base64') };
-  const { sp, out } = setup(undefined, BEATS, () => new Map(BEATS.map((b) => [b, clip])));
-  sp.setKey('k'); await tick(); await tick();
-  assert.equal(made.filter((v) => v.said.length).length, 0, 'no beat is recorded at run time');
-  const r = sp.start();
-  assert.equal(r.beat(), true);
-  assert.deepEqual(out.at(-1), { kind: 'speech', id: r.id, rate: 24000, pcm: clip.pcm });
-}
-{ // Every look's voice has every beat recorded, in both paid models (re-run beats/make.mjs after changing BEATS).
-  const side = readFileSync(new URL('../sidekick.mjs', import.meta.url), 'utf8');
-  const { DEFAULT_VOICE } = await import('../fish.mjs');
-  const voices = [DEFAULT_VOICE, ...[...side.matchAll(/\['\w+', '[^']+', '([0-9a-f]{32})'\]/g)].map((m) => m[1])];
-  const get = bundledBeats();
-  for (const v of voices) for (const m of FISH_MODELS) {
-    const set = get(v, m);
-    assert.ok(set, `beats for ${v} on ${m}`);
-    for (const b of BEATS) assert.ok(set.get(b)?.pcm.length > 1000, `"${b}" in ${v} on ${m}`);
-  }
-}
-console.log('bundled beats: passed');

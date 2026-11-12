@@ -1,9 +1,5 @@
-// Speaks replies with Fish Audio and hands the audio to the overlay ({ kind: 'speech' } messages).
-// - The model is the one the user picked (Drama 3 or S2.1 Pro) while the account has credit, the free tier
-//   otherwise (checked when the key is set, at start and after a failure). If a reply's voice fails before any
-//   audio, it's retried on the next model down from the pick, never a pricier one (Drama 3 → S2.1 Pro → free;
-//   S2.1 Pro → free) with everything said so far, and one that works is kept from then on; if it fails after
-//   audio, the rest stays text only.
+// Speaks replies with Kokoro-82M local TTS and hands the audio to the overlay ({ kind: 'speech' } messages).
+// - Kokoro runs 100% locally via ONNX Runtime, no API key needed. Output is 24 kHz mono PCM.
 // - Each reply has its own id, so audio from one that was stopped can never play over the next.
 // - Beats: when something slow starts (a web search, a page, the screen) and the model hasn't said anything,
 //   a short line ("One sec.", "On it." and 32 more, picked at random) plays so it's never silent. They're made once
@@ -11,7 +7,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { DEFAULT_VOICE, FISH_MODELS, FREE_MODEL, FishVoice, RATE, fishAccount } from './fish.mjs';
+import { DEFAULT_VOICE, KokoroVoice, RATE, kokoroTTS } from './kokoro.mjs';
 
 // One or two words each, so a beat never sounds canned; any of them must fit before a search, a page, the screen or a drawing.
 export const BEATS = [
@@ -20,16 +16,17 @@ export const BEATS = [
   'Sure, sec.', 'Okay, sec.', 'Roger.', 'Yep.', 'Yep, sec.', 'Two secs.', 'Hold tight.', 'Mm-hmm.', 'Will do.', 'Righto.',
   'Moment.', 'Okay, checking.', 'Sure, checking.', 'Okie-dokie.',
 ];
+const BEAT_PHRASES = BEATS;
 const RECENT = 8; // a beat isn't picked again until this many others have played
 
-// The beats shipped with the app (beats/make.mjs), next to this file or the bundle: (voice, model) → Map of phrase →
-// { rate, pcm } (base64), or null for a voice or model not recorded. The free tier uses the S2.1 Pro takes.
+// The beats shipped with the app (beats/make.mjs), next to this file or the bundle: voice → Map of phrase → { rate, pcm }
+// (base64), or null for a voice not recorded.
 export function bundledBeats(dir = path.join(path.dirname(fileURLToPath(import.meta.url)), 'beats')) {
   let index = null;
   try { index = JSON.parse(fs.readFileSync(path.join(dir, 'index.json'), 'utf8')); } catch { return () => null; }
   const sets = new Map();
-  return (voice, model) => {
-    const k = `${voice}:${model === FREE_MODEL ? 's2.1-pro' : model}`, set = index.sets?.[k];
+  return (voice) => {
+    const k = voice, set = index.sets?.[k];
     if (!set) return null;
     if (!sets.has(k)) {
       let all = null;
@@ -40,52 +37,39 @@ export function bundledBeats(dir = path.join(path.dirname(fileURLToPath(import.m
   };
 }
 
-export function createSpeaker({ emit, onProblem = () => {}, log = () => {}, FishVoiceImpl = FishVoice, account = fishAccount, beatPhrases = BEATS, bundled = bundledBeats() }) {
-  let key = null, voice = DEFAULT_VOICE, pref = FISH_MODELS[0], model = pref, seq = 0, current = null, checking = null;
-  // The pick and the cheaper ones after it (FISH_MODELS runs from priciest to free).
-  const chain = () => FISH_MODELS.slice(Math.max(0, FISH_MODELS.indexOf(pref)));
-  let beats = new Map(), recent = [], warming = null; // phrase → [base64 PCM chunks], for the current key and voice
+export function createSpeaker({ emit, onProblem = () => {}, log = () => {}, KokoroVoiceImpl = KokoroVoice, beatPhrases = BEAT_PHRASES, bundled = bundledBeats(), ttsImpl = null }) {
+  let voice = DEFAULT_VOICE, modelReady = false, seq = 0, current = null, warming = null;
+  let beats = new Map(), recent = []; // phrase → [base64 PCM chunks], for the current voice
+  const makeVoice = (handlers) => new KokoroVoiceImpl({ voice, ttsImpl, ...handlers });
   // A random beat, not one of the last few: one that's already made if there is one, so it plays instantly.
-  const shipped = () => bundled(voice, model);
+  const shipped = () => bundled(voice);
   const ready = (p) => beats.has(p) || !!shipped()?.has(p);
   const pickBeat = () => {
     const fresh = beatPhrases.filter((p) => !recent.includes(p));
     const pool = [fresh.filter(ready), beatPhrases.filter(ready), fresh, beatPhrases].find((x) => x.length);
-    const phrase = pool?.[Math.floor(Math.random() * pool.length)] ?? BEATS[0];
+    const phrase = pool?.[Math.floor(Math.random() * pool.length)] ?? BEAT_PHRASES[0];
     recent = [...recent, phrase].slice(-Math.min(RECENT, Math.max(0, beatPhrases.length - 1)));
     return phrase;
   };
 
-  // Make the beats once, one at a time (well under Fish's concurrency limit). Failures just leave a gap:
-  // that beat is then spoken live instead.
+  // Make the beats once, one at a time. Failures just leave a gap: that beat is then spoken live instead.
   function warm() {
-    const k = key, vo = voice;
+    const vo = voice;
     warming ??= (async () => {
+      // Ensure the model is loaded first (a stand-in skips this).
+      if (!ttsImpl) { try { await kokoroTTS(); } catch { return; } }
       for (const phrase of beatPhrases) {
-        if (key !== k || voice !== vo) break;
-        if (beats.has(phrase) || bundled(vo, model)?.has(phrase)) continue; // shipped with the app
+        if (voice !== vo) break;
+        if (beats.has(phrase) || bundled(vo)?.has(phrase)) continue; // shipped with the app
         const chunks = await new Promise((done) => {
           const got = [];
-          const v = new FishVoiceImpl({ key: k, voice: vo, model, onAudio: (pcm) => got.push(Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength).toString('base64')), onEnd: () => done(got), onError: () => done(null) }).open();
+          const v = makeVoice({ onAudio: (pcm) => got.push(Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength).toString('base64')), onEnd: () => done(got), onError: () => done(null) }).open();
           v.say(phrase); v.end();
         });
-        if (chunks?.length && key === k && voice === vo) beats.set(phrase, chunks);
+        if (chunks?.length && voice === vo) beats.set(phrase, chunks);
       }
     })().finally(() => { warming = null; });
     return warming;
-  }
-
-  // Returns the account check: { ok, credit } or { ok: false, reason: 'key' | 'network' }.
-  async function check() {
-    if (!key) return { ok: false, reason: 'key' };
-    checking ??= account(key).then((a) => {
-      // No credit: the free tier. Credit again: back to the best model, else keep the paid one that worked.
-      if (a.ok) model = a.credit != null && a.credit <= 0.01 ? FREE_MODEL : model === FREE_MODEL ? pref : model;
-      log('fish_account', { ok: a.ok, reason: a.reason, model });
-      if (a.ok) warm();
-      return a;
-    }).finally(() => { checking = null; });
-    return checking;
   }
 
   function stopAll() {
@@ -93,15 +77,15 @@ export function createSpeaker({ emit, onProblem = () => {}, log = () => {}, Fish
     emit({ kind: 'speech', stop: true });
   }
 
-  /** A new reply's voice, its socket opening now. say(sentence) as they come, then end(). */
+  /** A new reply's voice. say(sentence) as they come, then end(). */
   function start() {
-    if (!key) return null;
+    if (!modelReady) return null; // Kokoro not loaded yet
     stopAll();
     const id = `s${++seq}`, said = [];
-    let ended = false, tries = 0, v = null, heard = false, done = false, beat = false, t0 = Date.now();
+    let ended = false, v = null, heard = false, done = false, beat = false, t0 = Date.now();
     const me = {
       id,
-      say(s) { if (done) return; said.push(s); v.say(s); },
+      say(s) { if (done) return; said.push(s); v?.say(s); },
       /** Something slow is starting: a short beat, unless it's already said something. */
       beat() {
         if (done || beat || said.length || heard) return false;
@@ -113,11 +97,9 @@ export function createSpeaker({ emit, onProblem = () => {}, log = () => {}, Fish
         else for (const pcm of chunks) emit({ kind: 'speech', id, rate: RATE, pcm });
         return true;
       },
-      end() { if (done || ended) return; ended = true; v.end(); },
+      end() { if (done || ended) return; ended = true; v?.end(); },
       abort() { if (done) return; done = true; v?.abort(); if (current === me) current = null; },
     };
-    // A reply that played to its end also says how much it said (without the voice cues), so the overlay can learn
-    // how fast the voice talks and pace drawings to it.
     const finish = (whole = false) => {
       if (done) return;
       done = true;
@@ -125,57 +107,47 @@ export function createSpeaker({ emit, onProblem = () => {}, log = () => {}, Fish
       emit({ kind: 'speech', id, end: true, ...(chars ? { chars } : {}) });
       if (current === me) current = null;
     };
-    const connect = (m) => {
-      tries++;
-      v = new FishVoiceImpl({
-        key, voice, model: m,
-        onAudio: (pcm) => {
-          if (done) return;
-          if (!heard) { heard = true; if (m !== model) model = m; log('speech_first_audio', { id, model: m, ms: Date.now() - t0 }); }
-          emit({ kind: 'speech', id, rate: RATE, pcm: Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength).toString('base64') });
-        },
-        onEnd: () => finish(true),
-        onError: async (err) => {
-          if (done) return;
-          log('speech_error', { id, model: m, heard: err.heard, message: err.message });
-          if (!err.heard && !heard && tries < chain().length) {
-            const a = await check();
-            if (done) return;
-            if (!a.ok && a.reason === 'key') { onProblem('key'); return finish(); }
-            // Retry: the free tier when there's no credit, else the next model down (the free one again once at the bottom).
-            const c = chain();
-            const next = a.ok && model === FREE_MODEL ? FREE_MODEL : c[Math.min(c.indexOf(m) + 1, c.length - 1)];
-            connect(next);
-            for (const s of said) v.say(s);
-            if (ended) v.end();
-            return;
-          }
-          if (!heard) onProblem(err.message);
-          finish();
-        },
-      }).open();
-    };
-    log('speech_start', { id, model });
-    connect(model);
+    v = makeVoice({
+      onAudio: (pcm) => {
+        if (done) return;
+        if (!heard) { heard = true; log('speech_first_audio', { id, ms: Date.now() - t0 }); }
+        emit({ kind: 'speech', id, rate: RATE, pcm: Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength).toString('base64') });
+      },
+      onEnd: () => finish(true),
+      onError: (err) => {
+        if (done) return;
+        log('speech_error', { id, heard: err.heard, message: err.message });
+        if (!heard) onProblem(err.message);
+        finish();
+      },
+    }).open();
+    log('speech_start', { id });
     current = me;
     return me;
   }
 
   return {
-    setKey(k) { if ((k || null) !== key) { beats = new Map(); if (!k) stopAll(); } key = k || null; if (key) check(); },
-    // The user's pick. Beats are remade in it; with no credit it stays on the free tier until there is some.
-    setModel(m) {
-      if (!FISH_MODELS.includes(m) || m === FREE_MODEL || m === pref) return;
-      pref = m; beats = new Map();
-      if (model !== FREE_MODEL) model = m;
-      if (key) warm();
+    /** Load Kokoro in the background. Call once at startup. */
+    async startModel() {
+      if (modelReady) return;
+      try {
+        if (!ttsImpl) await kokoroTTS();
+        modelReady = true;
+        warm();
+        log('kokoro_ready', {});
+      } catch (e) {
+        log('kokoro_error', { message: e.message });
+      }
     },
-    get pick() { return pref; },
-    setVoice(v) { if ((v || DEFAULT_VOICE) !== voice) beats = new Map(); voice = v || DEFAULT_VOICE; if (key) warm(); },
+    /** The user's selected voice (a Kokoro voice name like 'af_heart'). */
+    setVoice(v) {
+      if ((v || DEFAULT_VOICE) !== voice) beats = new Map();
+      voice = v || DEFAULT_VOICE;
+      if (modelReady) warm();
+    },
+    get voice() { return voice; },
     get ready() { return beats.size + beatPhrases.filter((p) => !beats.has(p) && shipped()?.has(p)).length; },
-    get model() { return model; },
-    get on() { return !!key; },
-    check,
+    get on() { return modelReady; },
     start,
     stop: stopAll,
   };
